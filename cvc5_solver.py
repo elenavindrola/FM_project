@@ -1,8 +1,10 @@
 #SMT
-
+import time
 import cvc5 #solver engine
 from cvc5 import Kind #library for math operations
 import compute_mks #slope calculator
+import json #raw data
+from fractions import Fraction
 
 # Initialize cvc5 Solver
 slv = cvc5.Solver()
@@ -21,23 +23,33 @@ def cvc5_sum(*terms):
     return slv.mkTerm(Kind.ADD, *terms)
 
 # Set Parameters
-T = 4 #planning horizon
+T = 24 #planning horizon in hours
 a = "0.8" #power cap
+
+with open("jobs.json", "r") as file:
+    raw_data = json.load(file)["jobs"]
+
+jobs = {}
+for j, data in raw_data.items():
+    #filter only jobs whose cpu stays <= 0.1 at every time slot 
+    # otherwise it returns unsat bc there are too many jobs that can't shift
+    #fraction needed otherwise e-05 exponential txt from json crashes
+    if all(val <= 0.1 for val in data["U"]): 
+        # nested dictionary (similar to json)
+        jobs[j] = {
+            "A": data["A"],
+            "L": data["L"],
+            "D": len(data["U"]),
+            #keep 8 decimal places for cpu, with fixed point type(decimal notation) (0.8f)
+            #cvc5 wants string format (f" ")
+            "U": [f"{val:.8f}" for val in data["U"]],
+        }
+        #omt takes too long, option to cut the data to solve in a reasonable time
+        # if len(jobs) == 50:
+        #     break
 
 # Fetch the slopes dynamically and format them as strings for cvc5
 slopes = [f"{m:.4f}" for m in compute_mks.slopes] 
-
-# SAT Dummy Job Data: {Arrival, Latest Start, Duration, CPU_per_hour}. 
-jobs = {
-    'J1': {'A': 0, 'L': 1, 'D': 2, 'U': ["0.4", "0.4"]},
-    'J2': {'A': 1, 'L': 2, 'D': 2, 'U': ["0.5", "0.5"]}
-}
-
-# #UNSAT Dummy Job Data: {Arrival, Latest Start, Duration, CPU_per_hour}. Uncomment to test
-# jobs = {
-#    'J1': {'A': 0, 'L': 1, 'D': 2, 'U': ["0.6", "0.6"]},
-#    'J2': {'A': 1, 'L': 2, 'D': 2, 'U': ["0.5", "0.5"]}
-# }
 
 # x_js - Binary start variables for each job
 x = {} #initialize dictionary containing all jobs with all possible start times
@@ -152,15 +164,21 @@ print("Satisfiability:", result)
 
 #OMT
 
+start_time = time.perf_counter()
+
 # Adjustable objective weights
 w_e = "1.0"     # Weight for total energy: sum(P_t)
 w_p  = "0.5"     # Weight for peak power: max(P_t)
 w_t   = "0.0001"  # Tie-breaker weight (keep << w_energy and w_peak)
 
-# Linearize Peak Power: P_peak >= P[t] for all t
+# Select Peak Power:
+#Create one constant real solver variable (P_peak)
 P_peak = slv.mkConst(real, "P_peak")
-for t in range(T):
-    slv.assertFormula(slv.mkTerm(Kind.GEQ, P_peak, P[t]))
+# declare possibilities for P_peak
+# (P_peak=P[0]) OR (P_peak=P[1]) OR (P_peak=P[2]) ... (P_peak=P[T-1]) 
+slv.assertFormula(slv.mkTerm(Kind.OR, *[slv.mkTerm(Kind.EQUAL, P_peak, P[t]) for t in range(T)]))
+# P_peak >= P[t] for all t (AND)
+slv.assertFormula(slv.mkTerm(Kind.AND, *[slv.mkTerm(Kind.GEQ, P_peak, P[t]) for t in range(T)]))
 
 # Total Energy = sum(P_t)
 total_energy = cvc5_sum(*P)
@@ -199,7 +217,9 @@ if best_Z is not None:
     #set the latest satisfiable best_Z found to be equal to Z
     slv.assertFormula(slv.mkTerm(Kind.EQUAL, Z, slv.mkReal(best_Z)))
     slv.checkSat()
-
+    
+    elapsed = time.perf_counter() - start_time
+    print(f"Solve Time:        {elapsed:.4f}s")
     print(f"Optimal Objective: {float(best_Z):.5f}")
     print(f"Total Energy: {float(slv.getValue(total_energy).getRealValue()):.3f}")
     print(f"Peak Power:   {float(slv.getValue(P_peak).getRealValue()):.3f}")

@@ -4,7 +4,8 @@ import cvc5 #solver engine
 from cvc5 import Kind #library for math operations
 import compute_mks #slope calculator
 import json #raw data
-from fractions import Fraction
+import gurobipy as gp
+from gurobipy import GRB
 
 # Initialize cvc5 Solver
 slv = cvc5.Solver()
@@ -33,7 +34,6 @@ jobs = {}
 for j, data in raw_data.items():
     #filter only jobs whose cpu stays <= 0.1 at every time slot 
     # otherwise it returns unsat bc there are too many jobs that can't shift
-    #fraction needed otherwise e-05 exponential txt from json crashes
     if all(val <= 0.1 for val in data["U"]): 
         # nested dictionary (similar to json)
         jobs[j] = {
@@ -45,8 +45,8 @@ for j, data in raw_data.items():
             "U": [f"{val:.8f}" for val in data["U"]],
         }
         #omt takes too long, option to cut the data to solve in a reasonable time
-        # if len(jobs) == 50:
-        #     break
+        if len(jobs) == 10:
+            break
 
 # Fetch the slopes dynamically and format them as strings for cvc5
 slopes = [f"{m:.4f}" for m in compute_mks.slopes] 
@@ -158,13 +158,7 @@ for t in range(T):
         power_terms.append(slv.mkTerm(Kind.MULT, slv.mkReal(slopes[k]), sigma[k][t]))
     slv.assertFormula(slv.mkTerm(Kind.EQUAL, P[t], cvc5_sum(*power_terms)))
 
-# Solve and Extract Results
-result = slv.checkSat()
-print("Satisfiability:", result)
-
 #OMT
-
-start_time = time.perf_counter()
 
 # Adjustable objective weights
 w_e = "1.0"     # Weight for total energy: sum(P_t)
@@ -201,28 +195,31 @@ obj_expr = cvc5_sum(
 )
 slv.assertFormula(slv.mkTerm(Kind.EQUAL, Z, obj_expr))
 
-best_Z = None
-slv.push() #push None into stack of rules
+# Set variables, Solve and Extract Results
+result = slv.checkSat()
+print("Satisfiability:", result)
 
-while slv.checkSat().isSat():
-    #update best_Z
+#optimization loop for cvc5
+if result.isSat():
+    start_time = time.perf_counter()
+    #initialize best_Z with Z
     best_Z = slv.getValue(Z).getRealValue()
-    slv.pop() #remove best_Z from stack of rules
-    slv.push() #pushes the updated best_Z into stack 
-    # Force next iteration to find a strictly lower objective value
-    slv.assertFormula(slv.mkTerm(Kind.LT, Z, slv.mkReal(best_Z)))
 
-if best_Z is not None:
-    slv.pop() # Remove the final UNSAT bound
+    while True:
+        slv.push() #add solver checkpoint to stack
+        # Z must be lower than best_Z
+        slv.assertFormula(slv.mkTerm(Kind.LT, Z, slv.mkReal(best_Z)))
+        if slv.checkSat().isSat():
+            # continue updating best_Z if sat
+            best_Z = slv.getValue(Z).getRealValue()
+        else: #if unsat
+            slv.pop()  # remove the last unsat checkpoint from stack
+            break #exit while loop
+    
     #set the latest satisfiable best_Z found to be equal to Z
     slv.assertFormula(slv.mkTerm(Kind.EQUAL, Z, slv.mkReal(best_Z)))
-    slv.checkSat()
-    
+    slv.checkSat()  # refresh model with Z = best_Z
     elapsed = time.perf_counter() - start_time
-    print(f"Solve Time:        {elapsed:.4f}s")
-    print(f"Optimal Objective: {float(best_Z):.5f}")
-    print(f"Total Energy: {float(slv.getValue(total_energy).getRealValue()):.3f}")
-    print(f"Peak Power:   {float(slv.getValue(P_peak).getRealValue()):.3f}")
 
     print("\nSchedule:")
     for j in jobs:
@@ -235,3 +232,84 @@ if best_Z is not None:
         u_val = float(slv.getValue(u[t]).getRealValue())
         p_val = float(slv.getValue(P[t]).getRealValue())
         print(f"  Hour {t}: CPU = {u_val:.2f}, Power = {p_val:.3f}")
+        
+#Gurobi MILP (mixed-integer-linear-programming)
+
+if result.isSat():
+    environment = gp.Env(params={"OutputFlag": 0}) #do not print gurobi flags
+    m = gp.Model("dc_milp", env=environment)
+
+    #redefine variables for MILP
+    x_g = {}
+    for j, data in jobs.items():
+        x_g[j] = {}
+        for s in range(data["A"], data["L"] + 1):
+            x_g[j][s] = m.addVar(vtype=GRB.BINARY)
+    # lb = lower bound, ub = upper bound
+    u_g = [m.addVar(lb=0.0, ub=1.0) for t in range(T)]
+    P_g = [m.addVar(lb=0.0, ub=float(a)) for t in range(T)]
+    #sigma = how much cpu falls inside k bucket at each hour t
+    sigma_g = [[m.addVar(lb=0.0, ub=0.2) for t in range(T)] for k in range(5)]
+    delta_g = [[m.addVar(vtype=GRB.BINARY) for t in range(T)] for k in range(4)]
+    # a single global variable for the entire horizon
+    P_peak_g = m.addVar(lb=0.0)
+
+    slopes_g = [float(m) for m in slopes]
+
+    #redefine constraints for MILP
+    for j in jobs:
+        #jobs must start only once
+        m.addConstr(gp.quicksum(x_g[j].values()) == 1)
+    
+    # k buckets constraint
+    for t in range(T):
+        # Sum CPU usage from all jobs active during hour t
+        active_cpu_terms = []
+        for j, data in jobs.items():
+            for s in x_g[j]:
+                job_end = s + data["D"] - 1
+                if s <= t <= job_end:
+                    cpu = float(data["U"][t - s]) #t-s bc U is indexed [0-(D-1)], so at t=10 if s=10 index=[0] OK
+                    active_cpu_terms.append(cpu * x_g[j][s])
+        m.addConstr(u_g[t] == gp.quicksum(active_cpu_terms)) #total cpu
+
+        #  total CPU u_g[t] is equal to the 5 buckets cpus sum
+        bucket_terms = []
+        for k in range(5):
+            bucket_terms.append(sigma_g[k][t])
+        m.addConstr(u_g[t] == gp.quicksum(bucket_terms))
+
+        # Force bucket k to fill (0.2) before bucket k+1 can unlock
+        for k in range(4):
+            # sigma = 0.2 max; if delta = 1 -> full; if delta = 0 -> filling
+            m.addConstr(sigma_g[k][t] >= 0.2 * delta_g[k][t])
+            # if delta = 0 -> sigma k+1 cannot fill; delta =1 -> sigma k+1 can start filling
+            m.addConstr(sigma_g[k + 1][t] <= 0.2 * delta_g[k][t])
+
+        # Multiply each bucket's CPU slice by its slope to get hourly power
+        power_terms = []
+        for k in range(5):
+            power_terms.append(slopes_g[k] * sigma_g[k][t])
+        m.addConstr(P_g[t] == gp.quicksum(power_terms))
+
+        # Ensure global peak power is at least hour t's power
+        m.addConstr(P_peak_g >= P_g[t])
+
+    total_energy_g = gp.quicksum(P_g)
+    tie_penalty_g = gp.quicksum(
+        #higher s (later start time) gets penalized in minimization
+        float(w_t) * s * x_g[j][s] for j in jobs for s in x_g[j]
+    )
+    m.setObjective(
+        float(w_e) * total_energy_g + float(w_p) * P_peak_g + tie_penalty_g,
+        GRB.MINIMIZE,
+    )
+
+    g_start = time.perf_counter()
+    m.optimize()
+    g_elapsed = time.perf_counter() - g_start
+
+print(f"Solve Time:        gurobi: {g_elapsed:.4f}s | cvc5: {elapsed:.4f}s")
+print(f"Optimal Objective (Z): {m.ObjVal:.5f}")
+print(f"Total Energy:      {total_energy_g.getValue():.3f}")
+print(f"Peak Power:        {P_peak_g.X:.3f}")
